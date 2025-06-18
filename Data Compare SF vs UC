@@ -1,0 +1,105 @@
+from pyspark.sql.functions import col, sha2, concat_ws
+from pyspark.sql import SparkSession
+
+# ----------------- Snowflake Config --------------------
+sfPassword = "FE_etl_@2020"
+sfDatabase = "FEEDWPROD"
+sfWarehouse = "DEV_WH"
+sfUser = "FESFSVCETL"
+SNOWFLAKE_SOURCE_NAME = "net.snowflake.spark.snowflake"
+
+sfOptions = {
+    "sfUrl": "farahexperiences.west-europe.azure.snowflakecomputing.com",
+    "sfUser": sfUser,
+    "sfPassword": sfPassword,
+    "sfDatabase": sfDatabase,
+    "sfSchema": "MAINTENANCE",
+    "sfWarehouse": sfWarehouse,
+    "parallelism": "8"
+}
+from pyspark.sql.functions import col, sha2, concat_ws
+
+# ----------------- Parameters --------------------------
+sf_table = "DWH_EH_DIM_PRODUCT"
+uc_table = "transformation_dev.gld_travelbox.dwh_dim_product"
+primary_key = "PRODUCT_NAME"
+
+# ----------------- List of Business Columns ------------
+columns_to_hash = [
+    "HOTEL_FLAG", "PARK_FLAG", "THEME_PARK_FLAG"
+]
+
+# ----------------- Load Snowflake Table ----------------
+query = f"SELECT * FROM EH.{sf_table}"
+
+try:
+    df_sf = spark.read \
+        .format(SNOWFLAKE_SOURCE_NAME) \
+        .options(**sfOptions) \
+        .option("query", query) \
+        .load()
+except Exception as e:
+    raise Exception(f"Issue reading Snowflake table: {e}")
+
+# ----------------- Load Unity Catalog Table ------------
+try:
+    df_uc = spark.table(uc_table)
+except Exception as e:
+    raise Exception(f"Issue reading Unity Catalog table: {e}")
+
+# ----------------- Filter to Active Records ------------
+df_sf = df_sf.filter(col("CURRENT_FLAG") == "Y")
+df_uc = df_uc.filter(col("CURRENT_FLAG") == "Y")
+
+# ----------------- Drop Duplicates ---------------------
+df_sf = df_sf.dropDuplicates([primary_key])
+df_uc = df_uc.dropDuplicates([primary_key])
+
+# ----------------- Rename PKs for clarity --------------
+df_sf = df_sf.withColumnRenamed(primary_key, "PK")
+df_uc = df_uc.withColumnRenamed(primary_key, "PK")
+
+# ----------------- Validate Columns --------------------
+for col_name in columns_to_hash:
+    if col_name not in df_sf.columns or col_name not in df_uc.columns:
+        raise ValueError(f"Column '{col_name}' missing in one of the dataframes")
+
+# ----------------- Create Hash Column ------------------
+df_sf = df_sf.withColumn("ROW_HASH", sha2(concat_ws("||", *[col(c) for c in columns_to_hash]), 256))
+df_uc = df_uc.withColumn("ROW_HASH", sha2(concat_ws("||", *[col(c) for c in columns_to_hash]), 256))
+
+# ----------------- Join and Compare --------------------
+joined_df = df_sf.join(df_uc, on="PK", how="inner") \
+    .select("PK", df_sf["ROW_HASH"].alias("SF_HASH"), df_uc["ROW_HASH"].alias("UC_HASH"))
+
+mismatch_df = joined_df.filter(col("SF_HASH") != col("UC_HASH"))
+matched_df = joined_df.filter(col("SF_HASH") == col("UC_HASH"))
+
+sf_only_df = df_sf.join(df_uc, on="PK", how="left_anti").select("PK")
+uc_only_df = df_uc.join(df_sf, on="PK", how="left_anti").select("PK")
+
+# ----------------- Output Summary ----------------------
+print("\nSummary Comparison Report")
+print(f"Total Active Records in Snowflake     : {df_sf.count()}")
+print(f"Total Active Records in Unity Catalog : {df_uc.count()}")
+print(f"Total Records with Matching Hash      : {matched_df.count()}")
+print(f"Total Records with Mismatched Hash    : {mismatch_df.count()}")
+print(f"Records Only in Snowflake but not in Unity catalog: {sf_only_df.count()}")
+print(f"Records Only in Unity Catalog but not in Snowflake: {uc_only_df.count()}")
+
+# ----------------- Show Results in Numbered List Format ------------------------
+
+print("\nRecords Only in Snowflake:")
+sf_only_list = sf_only_df.orderBy("PK").collect()
+for idx, row in enumerate(sf_only_list, start=1):
+    print(f"{idx}. {row['PK']}")
+
+print("\nRecords Only in Unity Catalog:")
+uc_only_list = uc_only_df.orderBy("PK").collect()
+for idx, row in enumerate(uc_only_list, start=1):
+    print(f"{idx}. {row['PK']}")
+
+print("\nMismatched Records (same PK, different values):")
+mismatch_list = mismatch_df.orderBy("PK").collect()
+for idx, row in enumerate(mismatch_list, start=1):
+    print(f"{idx}. {row['PK']}")
