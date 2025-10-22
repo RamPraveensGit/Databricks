@@ -1,0 +1,301 @@
+import requests
+import json
+import pandas as pd
+from typing import Dict, List, Optional
+
+# -----------------------------------------------------------------------------
+# STEP 1: Tableau Server Authentication and Metadata Retrieval via GraphQL
+# -----------------------------------------------------------------------------
+
+# === CONFIGURATION ===
+server_url = 'https://prod-apsoutheast-b.online.tableau.com'  
+api_version = '3.10'
+site_url = 'rampraveenramkisansingh-dcdbf1c841'
+
+# === PAT Credentials ===
+pat_name = 'rammiraltoken'
+pat_secret = '0QJc9dgRS2uN4dsZbnKi2Q==:xINOBRzgxlYt4tVdvTZlRwVWF0iyrQR8'  # ⚠️ Replace with your new PAT secret
+
+# === Auth URL and headers ===
+auth_url = f'{server_url}/api/{api_version}/auth/signin'
+headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json'
+}
+
+# === Payload using PAT only ===
+payload = {
+    "credentials": {
+        "personalAccessTokenName": pat_name,
+        "personalAccessTokenSecret": pat_secret,
+        "site": {
+            "contentUrl": site_url
+        }
+    }
+}
+
+# === POST the authentication request ===
+response = requests.post(auth_url, json=payload, headers=headers)
+if response.status_code == 200:
+    auth_token = response.json()['credentials']['token']
+    site_id = response.json()['credentials']['site']['id']
+    print(f' Authentication successful.\nToken: {auth_token}\nSite ID: {site_id}')
+else:
+    print(f' Authentication failed.\nStatus Code: {response.status_code}\nError: {response.text}')
+
+
+# -----------------------------------------------------------------------------
+# STEP 2: GraphQL Request for Metadata
+# -----------------------------------------------------------------------------
+
+graphql_query = """
+{
+  workbooks(filter: {name: "Superstore Sales Dashboard"}) {
+    id
+    name
+    luid
+    projectName
+    owner {
+      id
+      name
+    }
+    createdAt
+    updatedAt
+    upstreamTables {
+      name
+    }
+    upstreamLabels {
+      id
+    }
+    embeddedDatasources {
+      name
+      fields {
+        name
+        description
+      }
+    }
+    sheets {
+      name
+    }
+    parameters {
+      name
+    }
+    upstreamDatasourcesConnection {
+      nodes {
+        name
+        fields {
+          name
+        }
+      }
+    }
+    upstreamFlows {
+      name
+    }
+    downstreamMetrics {
+      name
+    }
+    downstreamMetricsConnection {
+      nodes {
+        id
+        name
+      }
+    }
+  }
+  calculatedFields {
+    name
+    description
+    dataType
+    formula
+    referencedByCalculations {
+      name
+      formula
+    }
+    upstreamDatabases {
+      name
+    }
+    downstreamSheets {
+      name
+    }
+    downstreamDashboards {
+      name
+    }
+    downstreamWorkbooks {
+      name
+      projectName
+      tags {
+        name
+      }
+      upstreamDataQualityWarnings {
+        warningType
+        author {
+          username
+        }
+      }
+    }
+  }
+}
+"""
+
+metadata_url = f'{server_url}/api/metadata/graphql'
+headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-Tableau-Auth': auth_token
+}
+response = requests.post(metadata_url, json={"query": graphql_query}, headers=headers)
+
+if response.status_code == 200:
+    metadata = response.json()
+    with open("metadata3.json", "w") as f:
+        json.dump(metadata, f, indent=4)
+    print(" Metadata successfully retrieved and saved to metadata3.json")
+else:
+    print(f' Failed to retrieve metadata.\nStatus Code: {response.status_code}\nError: {response.text}')
+
+
+# -----------------------------------------------------------------------------
+# STEP 3: Process Metadata JSON and Convert to a Flattened Excel File
+# -----------------------------------------------------------------------------
+
+# A helper function to translate Tableau formulas into a basic DAX-style formula.
+def translate_to_dax(tableau_formula: str) -> str:
+    replacements = {
+        'IF ': 'IF(',
+        ' THEN ': ', ',
+        ' ELSE ': ', ',
+        ' END': ')',
+        'AND': '&&',
+        'OR': '||',
+        '=': '==',
+        '[': '',
+        ']': '',
+        'ISNULL': 'ISBLANK',
+        'ZN(': 'IF(ISBLANK(',
+        'NOW()': 'NOW()',
+        'TODAY()': 'TODAY()',
+        'DATE(': 'DATE(',
+        'DATEPART(': 'FORMAT(',
+    }
+    dax_formula = tableau_formula
+    for tableau_piece, dax_piece in replacements.items():
+        dax_formula = dax_formula.replace(tableau_piece, dax_piece)
+    return dax_formula.strip()
+
+
+# Function to extract workbook details
+def extract_workbook_details(workbook: Dict) -> Dict:
+    return {
+        "workbook_id": workbook.get("id"),
+        "workbook_name": workbook.get("name"),
+        "luid": workbook.get("luid"),
+        "project_name": workbook.get("projectName"),
+        "owner_id": workbook.get("owner", {}).get("id"),
+        "owner_name": workbook.get("owner", {}).get("name"),
+        "created_at": workbook.get("createdAt"),
+        "updated_at": workbook.get("updatedAt"),
+    }
+
+# Function to process workbook-level entries (e.g., tables, datasources, sheets, parameters)
+def process_workbook_entries(workbook: Dict) -> List[Dict]:
+    base_entry = extract_workbook_details(workbook)
+    entries = []
+
+    # Upstream tables
+    for table in workbook.get("upstreamTables", []):
+        entries.append({**base_entry, "upstream_table": table.get("name")})
+
+    # Embedded datasources and fields
+    for ds in workbook.get("embeddedDatasources", []):
+        ds_entry = {**base_entry, "datasource_name": ds.get("name")}
+        for field in ds.get("fields", []):
+            entries.append({
+                **ds_entry,
+                "field_name": field.get("name"),
+                "field_description": field.get("description")
+            })
+
+    # Sheets
+    for sheet in workbook.get("sheets", []):
+        entries.append({**base_entry, "sheet_name": sheet.get("name")})
+
+    # Parameters
+    for param in workbook.get("parameters", []):
+        entries.append({**base_entry, "parameter_name": param.get("name")})
+
+    return entries
+
+# Function to process calculated fields and link them to workbooks,
+# while adding a new column with the corresponding Power BI formula.
+def process_calculated_fields(workbooks: List[Dict], calculated_fields: List[Dict]) -> List[Dict]:
+    # Create a mapping of workbook_id to workbook details for association.
+    workbook_map = {wb["id"]: extract_workbook_details(wb) for wb in workbooks}
+    entries = []
+
+    for calc_field in calculated_fields:
+        # Assume the calculated field belongs to the first workbook for simplicity.
+        workbook_id = workbooks[0]["id"] if workbooks else None
+        wb_details = workbook_map.get(workbook_id, {})
+
+        # Translate the formula from Tableau to a DAX-like syntax.
+        tableau_formula = calc_field.get("formula", "Unknown Formula")
+        dax_formula = translate_to_dax(tableau_formula)
+
+        base_calc_entry = {
+            **wb_details,
+            "calculated_field_name": calc_field.get("name"),
+            "calculated_field_description": calc_field.get("description"),
+            "data_type": calc_field.get("dataType"),
+            "formula": tableau_formula,
+            "power_bi_formula": dax_formula
+        }
+
+        # Add referenced calculations if available.
+        if calc_field.get("referencedByCalculations"):
+            for ref_calc in calc_field.get("referencedByCalculations", []):
+                ref_entry = {
+                    **base_calc_entry,
+                    "referenced_calc_name": ref_calc.get("name"),
+                    "referenced_formula": ref_calc.get("formula")
+                }
+                entries.append(ref_entry)
+        else:
+            entries.append(base_calc_entry)
+
+    return entries
+
+# Load the JSON data
+with open("metadata3.json", "r", encoding="utf-8") as file:
+    data = json.load(file)
+
+workbooks = data.get("data", {}).get("workbooks", [])
+calculated_fields = data.get("data", {}).get("calculatedFields", [])
+
+all_entries = []
+for wb in workbooks:
+    all_entries.extend(process_workbook_entries(wb))
+all_entries.extend(process_calculated_fields(workbooks, calculated_fields))
+
+# Convert to DataFrame
+df = pd.DataFrame(all_entries)
+
+# Reorder columns for better readability
+columns_order = [
+    "workbook_id", "workbook_name", "luid", "project_name", "owner_id", "owner_name",
+    "created_at", "updated_at", "upstream_table", "datasource_name", "field_name",
+    "field_description", "sheet_name", "parameter_name", "calculated_field_name",
+    "calculated_field_description", "data_type", "formula", "power_bi_formula",
+    "referenced_calc_name", "referenced_formula"
+]
+df = df[columns_order]
+
+# Fill NaN values with empty strings for better Excel readability
+df = df.fillna("")
+
+# Save to Excel using openpyxl
+output_file = "metadata_flat_formatted.xlsx"
+df.to_excel(output_file, sheet_name="Metadata", index=False)
+
+print(f" Data successfully exported to {output_file}")
+
+# Display the first few rows for verification
+print(df.head())

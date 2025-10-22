@@ -1,0 +1,174 @@
+# Folder creation
+!mkdir new_folder
+!mkdir xlsxFile_folder
+
+import xml.etree.ElementTree as ET
+import pandas as pd
+import os
+
+# ✅ Function to translate Tableau formulas to Power BI (DAX-like) syntax
+def translate_to_dax(tableau_formula):
+    replacements = {
+        'IF ': 'IF(',
+        ' THEN ': ', ',
+        ' ELSE ': ', ',
+        ' END': ')',
+        'AND': '&&',
+        'OR': '||',
+        '=': '==',
+        '[': '',
+        ']': '',
+        'ISNULL': 'ISBLANK',
+        'ZN(': 'IF(ISBLANK(',
+        'NOW()': 'NOW()',
+        'TODAY()': 'TODAY()',
+        'DATE(': 'DATE(',
+        'DATEPART(': 'FORMAT(',
+    }
+    dax_formula = tableau_formula
+    for tableau_piece, dax_piece in replacements.items():
+        dax_formula = dax_formula.replace(tableau_piece, dax_piece)
+    return dax_formula.strip()
+
+# ✅ Function to parse Tableau metadata and structure the output
+def parse_tableau_metadata(file_path):
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+
+        metadata_records = []
+
+        # Project & workbook name
+        project_elem = root.find(".//repository-location")
+        project_name = project_elem.attrib.get("site", "Unknown") if project_elem is not None else "Unknown"
+        workbook_name = project_elem.attrib.get("id", "Unknown") if project_elem is not None else "Unknown"
+
+        # Dashboards
+        dashboard_elems = root.findall(".//window[@class='dashboard']")
+        dashboard_name = "N/A" if not dashboard_elems else None
+        if dashboard_elems:
+            for dashboard in dashboard_elems:
+                dashboard_name = dashboard.attrib.get("name", "Unknown")
+
+        # Worksheets and Filters
+        worksheet_elems = root.findall(".//window[@class='worksheet']")
+        for worksheet in worksheet_elems:
+            worksheet_name = worksheet.attrib.get("name", "Unknown")
+            filter_cards = worksheet.findall(".//card[@type='filter']")
+            for card in filter_cards:
+                filter_name = card.attrib.get("name", "Unknown Filter")
+                metadata_records.append({
+                    "Project Name": project_name,
+                    "Workbook Name": workbook_name,
+                    "Dashboard Name": dashboard_name,
+                    "Worksheet Name": worksheet_name,
+                    "Type": "Filter",
+                    "Detail": filter_name,
+                    "Power BI Formula": "N/A",
+                    "Data Source Name": "N/A",
+                    "View": "N/A"
+                })
+
+        # Parameters
+        param_fields = root.findall(".//column[@param-domain-type]")
+        for param in param_fields:
+            param_name = param.attrib.get("caption", "Unknown")
+            param_type = param.attrib.get("datatype", "Unknown")
+            metadata_records.append({
+                "Project Name": project_name,
+                "Workbook Name": workbook_name,
+                "Dashboard Name": dashboard_name,
+                "Worksheet Name": "N/A",
+                "Type": "Parameter",
+                "Detail": f"{param_name} (Type: {param_type})",
+                "Power BI Formula": "N/A",
+                "Data Source Name": "N/A",
+                "View": "N/A"
+            })
+
+        # Data Sources and Columns
+        data_source_elems = root.findall(".//datasource")
+        for ds in data_source_elems:
+            data_source_name = ds.attrib.get("caption", ds.attrib.get("name", "Unknown Data Source"))
+            metadata_columns = root.findall(".//metadata-record[@class='column']")
+            for record in metadata_columns:
+                column_name_elem = record.find("remote-name")
+                column_name = column_name_elem.text if column_name_elem is not None else "Unknown Column"
+                column_type_elem = record.find("local-type")
+                column_type = column_type_elem.text if column_type_elem is not None else "Unknown Type"
+                family_elem = record.find("family")
+                family_name = family_elem.text if family_elem is not None else "Unknown View"
+
+                metadata_records.append({
+                    "Project Name": project_name,
+                    "Workbook Name": workbook_name,
+                    "Dashboard Name": "N/A",
+                    "Worksheet Name": "N/A",
+                    "Type": "Column",
+                    "Detail": f"{column_name} (Type: {column_type}, View: {family_name})",
+                    "Power BI Formula": "N/A",
+                    "Data Source Name": data_source_name,
+                    "View": family_name
+                })
+
+        # Calculated Fields with Power BI Formula
+        calculated_fields = root.findall(".//column[calculation]")
+        for calc in calculated_fields:
+            calc_name = calc.attrib.get("caption", calc.attrib.get("name", "Unknown Calculated Field"))
+            calc_type = calc.attrib.get("datatype", "Unknown Type")
+            formula_elem = calc.find("calculation")
+            formula = formula_elem.attrib.get("formula", "Unknown Formula") if formula_elem is not None else "Unknown Formula"
+            dax_formula = translate_to_dax(formula)
+
+            metadata_records.append({
+                "Project Name": project_name,
+                "Workbook Name": workbook_name,
+                "Dashboard Name": "N/A",
+                "Worksheet Name": "N/A",
+                "Type": "Calculated Field",
+                "Detail": f"{calc_name} (Type: {calc_type}, Formula: {formula})",
+                "Power BI Formula": dax_formula,
+                "Data Source Name": data_source_name,
+                "View": "N/A"
+            })
+
+        return metadata_records
+
+    except ET.ParseError as e:
+        print(f"Error parsing XML: {e}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return []
+
+# ✅ Save to Excel
+def save_metadata_to_excel(metadata, output_file, max_rows_per_sheet=100000):
+    if not metadata:
+        print("No metadata to save. The Excel file will not be generated.")
+        return
+
+    df = pd.DataFrame(metadata)
+    num_sheets = -(-len(df) // max_rows_per_sheet)
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        for i in range(num_sheets):
+            start_idx = i * max_rows_per_sheet
+            end_idx = min((i + 1) * max_rows_per_sheet, len(df))
+            df_subset = df.iloc[start_idx:end_idx]
+            sheet_name = f"Sheet_{i+1}"
+            df_subset.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    print(f"✅ Metadata extracted and saved to {output_file} with {num_sheets} sheet(s).")
+
+# 🔄 Main process
+folder_path = "/content/new_folder"
+output_folder = "/content/xlsxFile_folder"
+os.makedirs(output_folder, exist_ok=True)
+
+for file_name in os.listdir(folder_path):
+    if file_name.endswith(".twb"):
+        file_path = os.path.join(folder_path, file_name)
+        output_file = os.path.join(output_folder, f"{os.path.splitext(file_name)[0]}.xlsx")
+
+        metadata = parse_tableau_metadata(file_path)
+        save_metadata_to_excel(metadata, output_file)

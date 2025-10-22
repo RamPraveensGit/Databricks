@@ -1,0 +1,335 @@
+
+#Step 1: 
+!mkdir -p /content/new_folder
+!mkdir -p /content/Output_folder
+
+#------------------------------------------------------------------------------------------------------
+#Step 2: 
+import xml.etree.ElementTree as ET
+import pandas as pd
+import os
+import re
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Static paths
+INPUT_FOLDER = "/content/new_folder"
+OUTPUT_FOLDER = "/content/Output_folder"
+
+# Alias mapping
+ALIASES_MAPPING = {
+    #"coa_master_all": r'F:\\Talend\\consumption\\/subanalysis/dwh_dim_subanalysis/dwh_dim_subanalysis.#csv',
+    #"ref": "REF_SUB_ANALYSIS_MAPPING",
+    #"sp_out": r'F:\\Talend\\standard\\/sp_output/sp_out_file.csv'
+}
+
+USELESS_EXPRESSIONS = {"|", "true", "false", "\\n", "\n"}
+
+def resolve_actual_object(node, context_parameters):
+    for param in node.findall(".//elementParameter[@name='FILENAME']"):
+        val = param.get("value", "").replace('"', "").strip()
+        for context in context_parameters:
+            context_name = context.get("name")
+            context_value = context.get("value")
+            if f"context.{context_name}" in val:
+                val = val.replace(f"context.{context_name}", context_value)
+        return val
+    for param in node.findall(".//elementParameter[@name='TABLE']"):
+        return param.get("value", "").replace("&quot;", "").strip()
+    for param in node.findall(".//elementParameter[@name='LABEL']"):
+        return param.get("value", "").strip()
+    return "Unknown"
+
+
+def extract_dbinput_info(nodes, context_parameters, job_name):
+    dbinput_data = []
+    for unique_name, node_info in nodes.items():
+        component = node_info.get("component_name", "")
+        
+        # Check for tDBInput, tOracleInput, tBigQueryInput components
+        if component.lower().endswith("input") and "tmap" not in component.lower():
+            element = node_info.get("element")
+            table_name = "Unknown"
+            query_text = ""
+            schema = ""
+            
+            # Extract common parameters (e.g., TABLE and QUERY)
+            for param in element.findall(".//elementParameter"):
+                name = param.get("name", "")
+                value = param.get("value", "").replace("&quot;", "").strip()
+                
+                # For tDBInput, tOracleInput or tBigQueryInput, we need TABLE and QUERY values
+                if name == "TABLE":
+                    table_name = value
+                elif name == "SCHEMA_DB":
+                    for context in context_parameters:
+                        if f"context.{context.get('name')}" in value:
+                            value = value.replace(f"context.{context.get('name')}", context.get("value"))
+                    schema = value
+                elif name == "QUERY":
+                    for context in context_parameters:
+                        if f"context.{context.get('name')}" in value:
+                            value = value.replace(f"context.{context.get('name')}", context.get("value"))
+                    query_text = value
+
+            # If it's tBigQueryInput, add specific treatment for it
+            if component.lower() == "tbigqueryinput":
+                dbinput_data.append({
+                    "Job Name": job_name,
+                    "tMap Name": unique_name,
+                    "Source Object": schema,
+                    "Input Object": table_name,
+                    "Input Column": "-",
+                    "Input Expression": query_text,
+                    "Input Data Type": "-",
+                    "Output Column": "-",
+                    "Output Expression": "-",
+                    "Output Data Type": "-",
+                    "Output Object": "-"
+                })
+                
+            # Similarly, handle tDBInput and tOracleInput as well
+            else:
+                dbinput_data.append({
+                    "Job Name": job_name,
+                    "tMap Name": unique_name,
+                    "Source Object": schema,
+                    "Input Object": table_name,
+                    "Input Column": "-",
+                    "Input Expression": query_text,
+                    "Input Data Type": "-",
+                    "Output Column": "-",
+                    "Output Expression": "-",
+                    "Output Data Type": "-",
+                    "Output Object": "-"
+                })
+                
+    return dbinput_data
+
+
+def extract_restclient_info(nodes, context_parameters, job_name):
+    restclient_data = []
+    for unique_name, node_info in nodes.items():
+        component = node_info.get("component_name", "")
+        
+        # Check for tRESTClient component
+        if component.lower() == "trestclient":
+            element = node_info.get("element")
+            api_endpoint = "Unknown"
+            
+            # Extract API endpoint URL (usually in the URI or URL element)
+            for param in element.findall(".//elementParameter"):
+                name = param.get("name", "")
+                value = param.get("value", "").replace("&quot;", "").strip()
+                
+                if name == "URI" or name == "URL":
+                    # Resolve context variables if any
+                    for context in context_parameters:
+                        context_name = context.get("name")
+                        context_value = context.get("value")
+                        if f"context.{context_name}" in value:
+                            value = value.replace(f"context.{context_name}", context_value)
+                    api_endpoint = value
+
+            # Add extracted API endpoint to the restclient_data
+            restclient_data.append({
+                "Job Name": job_name,
+                "tMap Name": unique_name,
+                "Source Object": "-",
+                "Input Object": "-",
+                "Input Column": "-",
+                "Input Expression": api_endpoint,
+                "Input Data Type": "-",
+                "Output Column": "-",
+                "Output Expression": "-",
+                "Output Data Type": "-",
+                "Output Object": "-"
+            })
+                
+    return restclient_data
+
+
+def extract_extractjsonfields_info(nodes, context_parameters, job_name, restclient_info_list):
+    extractjsonfields_data = []
+
+    # Create a mapping from tMap Name to Input Expression (API URL)
+    restclient_map = {rc["tMap Name"]: rc["Input Expression"] for rc in restclient_info_list}
+
+    for unique_name, node_info in nodes.items():
+        component = node_info.get("component_name", "")
+        
+        if component.lower() == "textractjsonfields":
+            element = node_info.get("element")
+            api_endpoint = restclient_map.get(unique_name, "Unknown")
+
+            # Look inside <metadata connector="FLOW"...> for column definitions
+            for metadata in element.findall(".//metadata[@connector='FLOW']"):
+                for column in metadata.findall(".//column"):
+                    input_column = column.get("name", "Unknown")
+
+                    extractjsonfields_data.append({
+                        "Job Name": job_name,
+                        "tMap Name": unique_name,
+                        "Source Object": "-",
+                        "Input Object": api_endpoint,
+                        "Input Column": input_column,
+                        "Input Expression": "-",
+                        "Input Data Type": column.get("type", "-"),
+                        "Output Column": "-",
+                        "Output Expression": "-",
+                        "Output Data Type": "-",
+                        "Output Object": "-"
+                    })
+
+    return extractjsonfields_data
+
+
+def parse_talend_job(filepath):
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+    context_parameters = root.findall(".//contextParameter")
+    job_name = os.path.splitext(os.path.basename(filepath))[0]
+
+    nodes, connections = {}, []
+    for node in root.findall(".//node"):
+        unique_name = next((p.get("value") for p in node.findall(".//elementParameter[@name='UNIQUE_NAME']")), None)
+        actual_object = resolve_actual_object(node, context_parameters)
+        label = node.find(".//elementParameter[@name='LABEL']")
+        label_or_object = label.get("value") if label is not None else actual_object
+        if unique_name:
+            nodes[unique_name] = {
+                "component_name": node.get("componentName", "Unknown"),
+                "actual_object": actual_object,
+                "label_or_object": label_or_object,
+                "element": node
+            }
+
+    for conn in root.findall(".//connection"):
+        connections.append({
+            "label": conn.get("label", "Unknown"),
+            "source": conn.get("source"),
+            "target": conn.get("target")
+        })
+
+    mappings_data = parse_mappings(root, connections, nodes, job_name, context_parameters)
+    dbinput_data = extract_dbinput_info(nodes, context_parameters, job_name)
+    restclient_data = extract_restclient_info(nodes, context_parameters, job_name)
+    extractjsonfields_data = extract_extractjsonfields_info(nodes, context_parameters, job_name, restclient_data)
+
+    return dbinput_data + restclient_data + extractjsonfields_data + mappings_data
+
+
+def parse_mappings(root, connections, nodes, job_name, context_parameters):
+    combined_data = []
+
+    for tmap_node in root.findall(".//node[@componentName='tMap']"):
+        tmap_name = tmap_node.find(".//elementParameter[@name='UNIQUE_NAME']").get("value", "Unknown")
+
+        input_objects, source_objects, input_exprs = {}, {}, {}
+        for conn in connections:
+            if conn["target"] == tmap_name:
+                source_node = nodes.get(conn["source"])
+                if not source_node:
+                    continue
+                table_num = conn["label"].replace("row", "")
+                component_name = source_node.get("component_name")
+                input_objects[table_num] = source_node.get("label_or_object", "Unknown")
+                source_objects[table_num] = source_node.get("actual_object", "Unknown")
+
+                if component_name == "tFileInputDelimited":
+                    expressions = []
+                    for param in source_node["element"].findall(".//elementParameter"):
+                        val = param.get("value", "")
+                        if param.get("name", "").startswith("CSV") or "FIELD" in param.get("name", ""):
+                            if val.strip() not in USELESS_EXPRESSIONS:
+                                expressions.append(val)
+                    input_exprs[table_num] = ", ".join(set(expressions)).replace("&quot;", '"')
+
+        output_objects = []
+        for conn in connections:
+            if conn["source"] == tmap_name:
+                target_node = nodes.get(conn["target"])
+                output_objects.append(target_node.get("actual_object", "Unknown") if target_node else "Unknown")
+
+        input_tables = tmap_node.findall(".//inputTables")
+        output_tables = tmap_node.findall(".//outputTables")
+        input_rows, output_rows = [], []
+
+        for idx, table in enumerate(input_tables):
+            table_num = table.get("name").replace("row", "")
+            for entry in table.findall(".//mapperTableEntries"):
+                expr = input_exprs.get(table_num, "N/A")
+                if expr.strip() not in USELESS_EXPRESSIONS:
+                    input_rows.append({
+                        "Source Object": source_objects.get(table_num, "Unknown"),
+                        "Input Object": input_objects.get(table_num, "Unknown"),
+                        "Input Column": entry.get("name"),
+                        "Input Expression": expr,
+                        "Input Data Type": entry.get("type", "Unknown")
+                    })
+
+        for idx, table in enumerate(output_tables):
+            output_object = output_objects[idx] if idx < len(output_objects) else "Unknown"
+            for entry in table.findall(".//mapperTableEntries"):
+                expression = entry.get("expression", "").replace("&quot;", '"')
+                for alias, actual in ALIASES_MAPPING.items():
+                    expression = expression.replace(alias, actual)
+                output_rows.append({
+                    "Output Object": os.path.basename(output_object),
+                    "Output Column": entry.get("name"),
+                    "Output Expression": expression,
+                    "Output Data Type": entry.get("type", "Unknown")
+                })
+
+        max_len = max(len(input_rows), len(output_rows))
+        for i in range(max_len):
+            row = {
+                "Job Name": job_name,
+                "tMap Name": tmap_name
+            }
+            row.update(input_rows[i] if i < len(input_rows) else {
+                "Source Object": "N/A", "Input Object": "N/A", "Input Column": "N/A",
+                "Input Expression": "N/A", "Input Data Type": "N/A"
+            })
+            row.update(output_rows[i] if i < len(output_rows) else {
+                "Output Object": "N/A", "Output Column": "N/A",
+                "Output Expression": "N/A", "Output Data Type": "N/A"
+            })
+            combined_data.append(row)
+
+    return combined_data
+
+
+def process_all_jobs(folder_path):
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    all_data = []
+
+    for file in os.listdir(folder_path):
+        path = os.path.join(folder_path, file)
+        if os.path.isfile(path) and file.endswith(".item"):
+            logging.info(f"Processing: {file}")
+            file_data = parse_talend_job(path)
+            all_data.extend(file_data)
+
+    if all_data:
+        df = pd.DataFrame(all_data)
+        col_order = [
+            "Job Name", "tMap Name", "Source Object", "Input Object", "Input Column",
+            "Input Expression", "Input Data Type", "Output Column",
+            "Output Expression", "Output Data Type", "Output Object"
+        ]
+        df = df[col_order]
+        output_path = os.path.join(OUTPUT_FOLDER, "final_combined_mapping.xlsx")
+        df.to_excel(output_path, sheet_name="CombinedMapping", index=False)
+        logging.info(f"Final combined mapping saved to {output_path}")
+    else:
+        logging.info("No .item files found or no data extracted.")
+
+
+# Run with static input path
+if os.path.exists(INPUT_FOLDER):
+    process_all_jobs(INPUT_FOLDER)
+else:
+    logging.error(f"Input folder path not found: {INPUT_FOLDER}")
